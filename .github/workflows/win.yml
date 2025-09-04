@@ -10,7 +10,7 @@ on:
 
 jobs:
   run-ollama:
-    runs-on: ubuntu-latest  # best free option (4 vCPU, 14 GB RAM)
+    runs-on: ubuntu-latest  # strongest free runner (4 vCPU, 14 GB RAM)
 
     steps:
       - name: Checkout repo
@@ -23,14 +23,13 @@ jobs:
 
       - name: Install Ollama
         run: |
-          curl -fsSL https://ollama.com/download/ollama-linux-amd64.tgz -o ollama.tgz
-          sudo tar -xzf ollama.tgz -C /usr/local/bin
+          curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
 
       - name: Start Ollama server
         run: |
           nohup ollama serve > /tmp/ollama.log 2>&1 &
-          sleep 5
+          sleep 8
           curl -s http://localhost:11434 || (echo "Ollama server did not start" && exit 1)
 
       - name: Pull llama3:8b
@@ -41,4 +40,4 @@ jobs:
           echo "Prompt: ${{ github.event.inputs.prompt }}"
           curl -N -s -X POST http://localhost:11434/api/generate \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt }}\",\"stream\":true}"
+            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt}}\",\"stream\":true}"
