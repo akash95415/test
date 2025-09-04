@@ -1,0 +1,166 @@
+name: Ollama 8B Streaming Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt to send to the model'
+        required: true
+        default: 'Benchmark: generate 128 tokens of simple text to measure speed.'
+      model:
+        description: 'Model to pull/run (ollama name)'
+        required: true
+        default: 'llama3:8b'
+      run_matrix:
+        description: 'Which runners to run (comma separated: ubuntu,macos)'
+        required: true
+        default: 'ubuntu,macos'
+
+jobs:
+  benchmark:
+    # We'll create a small matrix to optionally run on ubuntu and macos in one workflow run
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJson('["' + github.event.inputs.run_matrix | replace(',','","') + '"]') }}
+        # This maps our simple names to real runner labels:
+        include:
+          - os: ubuntu
+            runner: ubuntu-latest
+          - os: macos
+            runner: macos-latest
+    name: Ollama streaming on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up environment variables
+        run: |
+          echo "OLLAMA_PORT=11434" >> $GITHUB_ENV
+          echo "PROMPT<<EOF" >> $GITHUB_ENV
+          echo "${{ github.event.inputs.prompt }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "MODEL=${{ github.event.inputs.model }}" >> $GITHUB_ENV
+
+      - name: Install prerequisites & Ollama (best-effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner: $RUNNER_OS"
+          # jq is used for optional parsing; curl will stream.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            echo "macOS runner detected — using Homebrew for install"
+            if ! command -v brew >/dev/null 2>&1; then
+              echo "Homebrew not found — installing Homebrew (may require user approval on macOS hosted runner)"
+              /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+            fi
+            brew update || true
+            brew install jq || true
+            brew install ollama || true
+          else
+            echo "Assuming Linux runner — attempting Ollama linux installer"
+            sudo apt-get update -y || true
+            sudo apt-get install -y jq curl ca-certificates || true
+            # Ollama provides an installer script for Linux — run it if available
+            # This is a best-effort attempt; if the installer changes, the step might need to be updated.
+            if ! command -v ollama >/dev/null 2>&1; then
+              echo "Attempting to install Ollama (Linux installer)..."
+              curl -fsSL https://ollama.com/install.sh | sudo bash || true
+            fi
+            # If still missing, exit non-fatally but warn:
+            if ! command -v ollama >/dev/null 2>&1; then
+              echo "Warning: 'ollama' command not found after install attempt. The job may fail when calling ollama."
+            fi
+          fi
+
+      - name: Start Ollama server (background) and wait
+        shell: bash
+        run: |
+          set -euo pipefail
+          OLLAMA_PORT=${OLLAMA_PORT:-11434}
+          # Start server in background; prefer service if available
+          if command -v ollama >/dev/null 2>&1; then
+            echo "Starting ollama server in background..."
+            # Use nohup to ensure it runs while job continues
+            nohup ollama serve >/tmp/ollama.log 2>&1 &
+            # wait for server to respond
+            for i in {1..30}; do
+              if curl -s "http://localhost:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+                echo "Ollama server is up."
+                break
+              fi
+              echo "Waiting for Ollama server... ($i)"
+              sleep 2
+            done
+          else
+            echo "ERROR: ollama binary not installed or not in PATH. Exiting."
+            exit 1
+          fi
+
+      - name: Pull Model (if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODEL="${MODEL}"
+          echo "Pulling model: $MODEL (this may take time and memory)"
+          # Pull will skip if model already exists locally
+          ollama pull "$MODEL" || {
+            echo "Warning: ollama pull failed (maybe model not available). Continuing to attempt run."
+          }
+
+      - name: Run streaming generate (real-time output)
+        shell: bash
+        env:
+          OLLAMA_PORT: ${{ env.OLLAMA_PORT }}
+          PROMPT: ${{ env.PROMPT }}
+          MODEL: ${{ env.MODEL }}
+        run: |
+          set -euo pipefail
+          # Use curl with --no-buffer / -N to allow streaming chunks to appear in the logs in real time.
+          # Ollama streaming will send chunked JSON lines — these will appear in GitHub Actions logs.
+          echo "=== Starting streaming generation ==="
+          echo "Model: $MODEL"
+          echo "Prompt preview (first 400 chars):"
+          echo "$PROMPT" | head -c 400 || true
+          echo
+          # Stream response to console and also save to file for later inspection
+          STREAM_OUT=/tmp/ollama_stream_output.ndjson
+          # Remove any previous file
+          rm -f "$STREAM_OUT"
+          # Note: using -N (--no-buffer) so curl flushes as chunks come
+          curl -s -N -X POST "http://localhost:${OLLAMA_PORT}/api/generate" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPT}\",\"stream\":true}" \
+            | tee "$STREAM_OUT"
+          echo
+          echo "=== Stream finished — saved to $STREAM_OUT ==="
+          echo "Preview (last 1200 chars):"
+          tail -c 1200 "$STREAM_OUT" || true
+
+      - name: Try to extract final metrics (best-effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          STREAM_OUT=/tmp/ollama_stream_output.ndjson
+          if [[ -f "$STREAM_OUT" ]]; then
+            # Many Ollama models stream JSON chunks. We'll try to find eval_count / eval_duration in the saved stream.
+            EVAL_COUNT=$(jq -r 'select(.eval_count != null) .eval_count' "$STREAM_OUT" 2>/dev/null | tail -n1 || true)
+            EVAL_DURATION_NS=$(jq -r 'select(.eval_duration != null) .eval_duration' "$STREAM_OUT" 2>/dev/null | tail -n1 || true)
+            if [[ -n "$EVAL_COUNT" && -n "$EVAL_DURATION_NS" ]]; then
+              DURATION_S=$(awk -v ns="$EVAL_DURATION_NS" 'BEGIN{printf "%.6f", ns/1e9}')
+              TPS=$(awk -v t="$EVAL_COUNT" -v s="$DURATION_S" 'BEGIN{ if (s>0) printf "%.2f", t/s; else print "inf" }')
+              echo "=== Derived metrics ==="
+              echo "eval_count: $EVAL_COUNT"
+              echo "eval_duration_ns: $EVAL_DURATION_NS"
+              echo "eval_duration_s: $DURATION_S"
+              echo "tokens/sec: $TPS"
+            else
+              echo "No eval_count/eval_duration found in stream output. Inspect the full stream file: $STREAM_OUT"
+              ls -l "$STREAM_OUT" || true
+            fi
+          else
+            echo "Stream file not found: $STREAM_OUT"
+          fi
