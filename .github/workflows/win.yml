@@ -1,4 +1,4 @@
-name: Ollama Llama3 8B Eval
+name: Ollama Llama3 8B Eval (Ubuntu)
 
 on:
   workflow_dispatch:
@@ -9,63 +9,97 @@ on:
         default: "Benchmark: generate 128 tokens of simple text to measure speed."
 
 jobs:
-  run-ollama:
-    runs-on: ubuntu-latest  # strongest free runner (4 vCPU, 14 GB RAM)
-
+  ollama-eval:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Prepare deps (Linux)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl jq bc
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq ca-certificates
 
-      - name: Install Ollama
+      - name: Install Ollama (official installer)
         run: |
+          # Use the official Ollama install script (detects arch)
           curl -fsSL https://ollama.com/install.sh | sh
+          # ensure binary is available
+          if ! command -v ollama >/dev/null 2>&1; then
+            echo "ERROR: ollama not found after install; listing /usr/local/bin /usr/bin"
+            ls -la /usr/local/bin /usr/bin || true
+            exit 1
+          fi
           ollama --version
 
-      - name: Start Ollama server
+      - name: Start Ollama server and wait
         run: |
+          export OLLAMA_PORT=11434
           nohup ollama serve > /tmp/ollama.log 2>&1 &
-          sleep 8
-          curl -s http://localhost:11434 || (echo "Ollama server did not start" && exit 1)
+          # wait up to 60s
+          for i in $(seq 1 30); do
+            if curl -s "http://localhost:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+              echo "Ollama up"
+              break
+            fi
+            echo "waiting for ollama... ($i)"
+            sleep 2
+          done
+          curl -s "http://localhost:${OLLAMA_PORT}/" || (echo "Ollama didn't start" && tail -n +1 /tmp/ollama.log && exit 1)
 
-      - name: Pull llama3:8b
-        run: ollama pull llama3:8b
-
-      - name: Run prompt in streaming mode (real-time tokens)
+      - name: Pull model (llama3:8b)
         run: |
-          echo "----- Streaming Output -----"
-          curl -N -s -X POST http://localhost:11434/api/generate \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt }}\",\"stream\":true}"
-          echo ""
-          echo "----- End Streaming Output -----"
+          MODEL="llama3:8b"
+          echo "Pulling $MODEL (may be heavy)"
+          ollama pull "$MODEL" || (echo "warning: pull failed or model unavailable; continuing to attempt run" && true)
 
-      - name: Run prompt in non-streaming mode (for metrics)
+      - name: Streaming generation (live output saved)
+        env:
+          OLLAMA_PORT: 11434
+          PROMPT: ${{ github.event.inputs.prompt }}
         run: |
-          JSON_RESP=$(curl -s -X POST http://localhost:11434/api/generate \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt }}\",\"stream\":false}\")
-
-          echo "Raw JSON (first 500 chars):"
-          echo "$JSON_RESP" | head -c 500
+          MODEL="llama3:8b"
+          echo "=== STREAM START ==="
+          # Build safe JSON using jq to avoid quoting issues, then stream with curl -N
+          jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:true}' \
+            | curl -s -N -X POST "http://localhost:${OLLAMA_PORT}/api/generate" \
+                -H "Content-Type: application/json" -d @- \
+            | tee /tmp/ollama_stream.ndjson
+          echo "=== STREAM END ==="
           echo ""
+          echo "Saved stream to /tmp/ollama_stream.ndjson (preview last 1k chars):"
+          tail -c 1024 /tmp/ollama_stream.ndjson || true
 
-          EVAL_COUNT=$(echo "$JSON_RESP" | jq -r '.eval_count // .generations[0].eval_count // empty')
-          EVAL_DURATION=$(echo "$JSON_RESP" | jq -r '.eval_duration // .generations[0].eval_duration // empty')
+      - name: Non-streaming generation (metrics)
+        env:
+          OLLAMA_PORT: 11434
+          PROMPT: ${{ github.event.inputs.prompt }}
+        run: |
+          MODEL="llama3:8b"
+          # non-streaming JSON into file
+          jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}' \
+            | curl -s -X POST "http://localhost:${OLLAMA_PORT}/api/generate" \
+                -H "Content-Type: application/json" -d @- \
+            > /tmp/ollama_resp.json
 
-          if [ -n "$EVAL_COUNT" ] && [ -n "$EVAL_DURATION" ]; then
-            DURATION_SEC=$(echo "scale=6; $EVAL_DURATION/1000000000" | bc -l)
-            TOKENS_PER_SEC=$(echo "scale=2; $EVAL_COUNT/$DURATION_SEC" | bc -l)
-            echo "----- Metrics -----"
+          echo "Raw response head (first 800 chars):"
+          head -c 800 /tmp/ollama_resp.json || true
+          echo
+
+          EVAL_COUNT=$(jq -r '.eval_count // .generations[0].eval_count // ""' /tmp/ollama_resp.json)
+          EVAL_DURATION_NS=$(jq -r '.eval_duration // .generations[0].eval_duration // ""' /tmp/ollama_resp.json)
+
+          if [[ -n "$EVAL_COUNT" && -n "$EVAL_DURATION_NS" ]]; then
+            # compute seconds and tokens/sec with awk (avoid bc portability)
+            DURATION_S=$(awk -v ns="$EVAL_DURATION_NS" 'BEGIN{printf "%.6f", ns/1e9}')
+            TPS=$(awk -v t="$EVAL_COUNT" -v s="$DURATION_S" 'BEGIN{ if (s>0) printf "%.2f", t/s; else print "NaN"}')
+            echo "===== METRICS ====="
             echo "eval_count (tokens): $EVAL_COUNT"
-            echo "eval_duration (ns): $EVAL_DURATION"
-            echo "eval_duration (s): $DURATION_SEC"
-            echo "tokens/sec ≈ $TOKENS_PER_SEC"
-            echo "------------------"
+            echo "eval_duration (ns): $EVAL_DURATION_NS"
+            echo "eval_duration (s): $DURATION_S"
+            echo "tokens/sec: $TPS"
+            echo "==================="
           else
-            echo "No metrics found in response."
+            echo "Metrics not found inside response. Inspect /tmp/ollama_resp.json"
+            jq '.' /tmp/ollama_resp.json || true
           fi
