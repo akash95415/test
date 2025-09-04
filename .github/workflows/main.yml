@@ -1,59 +1,69 @@
-name: Ollama Benchmark
+name: Ollama Llama3 8B Eval (macOS Latest)
 
 on:
-  workflow_dispatch: # run manually from Actions tab
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt to send to Ollama"
+        required: true
+        default: "Benchmark: generate 128 tokens of simple text to measure speed."
 
 jobs:
-  benchmark:
-    runs-on: macos-13
+  run-ollama:
+    runs-on: macos-latest
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Run Ollama benchmark script
-        shell: bash
+      - name: Install dependencies
+        run: brew install jq coreutils
+
+      - name: Install Ollama
         run: |
-          set -euo pipefail
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
 
-          MODEL="llama3:8b"
-          PROMPT="Benchmark: generate 128 tokens of simple text to measure speed."
-          OLLAMA_PORT=11434
+      - name: Start Ollama server
+        run: |
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          sleep 8
+          curl -s http://localhost:11434 || (echo "Ollama server did not start" && exit 1)
 
-          echo "1) Install jq..."
-          brew install jq
+      - name: Pull llama3:8b
+        run: ollama pull llama3:8b
 
-          echo "2) Install Ollama..."
-          brew install ollama
+      - name: Run prompt in streaming mode (real-time tokens)
+        run: |
+          echo "----- Streaming Output -----"
+          curl -N -s -X POST http://localhost:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt }}\",\"stream\":true}"
+          echo ""
+          echo "----- End Streaming Output -----"
 
-          echo "3) Start Ollama server..."
-          nohup ollama serve >/tmp/ollama.log 2>&1 &
-          sleep 5
+      - name: Run prompt in non-streaming mode (for metrics)
+        run: |
+          JSON_RESP=$(curl -s -X POST http://localhost:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt }}\",\"stream\":false}\")
 
-          echo "4) Pull model: $MODEL"
-          ollama pull "$MODEL"
-
-          echo "5) Generate and capture metrics..."
-          JSON_RESP=$(curl -s -X POST "http://localhost:${OLLAMA_PORT}/api/generate" \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPT}\",\"stream\":false}")
-
-          echo "Response preview:"
-          echo "$JSON_RESP" | head -c 800
-          echo
+          echo "Raw JSON (first 500 chars):"
+          echo "$JSON_RESP" | head -c 500
+          echo ""
 
           EVAL_COUNT=$(echo "$JSON_RESP" | jq -r '.eval_count // .generations[0].eval_count // empty')
-          EVAL_DURATION_NS=$(echo "$JSON_RESP" | jq -r '.eval_duration // .generations[0].eval_duration // empty')
+          EVAL_DURATION=$(echo "$JSON_RESP" | jq -r '.eval_duration // .generations[0].eval_duration // empty')
 
-          if [ -n "$EVAL_COUNT" ] && [ -n "$EVAL_DURATION_NS" ]; then
-            DURATION_S=$(awk -v ns="$EVAL_DURATION_NS" 'BEGIN{printf "%.6f", ns/1e9}')
-            TOKENS_PER_SEC=$(awk -v t="$EVAL_COUNT" -v s="$DURATION_S" 'BEGIN{ if (s>0) printf "%.2f", t/s; else print "inf"}')
-            echo "=== Metrics ==="
-            echo "eval_count: $EVAL_COUNT"
-            echo "eval_duration_ns: $EVAL_DURATION_NS"
-            echo "eval_duration_s: $DURATION_S"
-            echo "tokens/sec: $TOKENS_PER_SEC"
+          if [ -n "$EVAL_COUNT" ] && [ -n "$EVAL_DURATION" ]; then
+            DURATION_SEC=$(echo "scale=6; $EVAL_DURATION/1000000000" | bc -l)
+            TOKENS_PER_SEC=$(echo "scale=2; $EVAL_COUNT/$DURATION_SEC" | bc -l)
+            echo "----- Metrics -----"
+            echo "eval_count (tokens): $EVAL_COUNT"
+            echo "eval_duration (ns): $EVAL_DURATION"
+            echo "eval_duration (s): $DURATION_SEC"
+            echo "tokens/sec ≈ $TOKENS_PER_SEC"
+            echo "------------------"
           else
-            echo "No eval_count/eval_duration found. Full JSON saved."
-            echo "$JSON_RESP" > /tmp/ollama_resp.json
+            echo "No metrics found in response."
           fi
