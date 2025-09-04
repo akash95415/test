@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl jq
+          sudo apt-get install -y curl jq bc
 
       - name: Install Ollama
         run: |
@@ -35,9 +35,37 @@ jobs:
       - name: Pull llama3:8b
         run: ollama pull llama3:8b
 
-      - name: Run prompt in streaming mode
+      - name: Run prompt in streaming mode (real-time tokens)
         run: |
-          echo "Prompt: ${{ github.event.inputs.prompt }}"
+          echo "----- Streaming Output -----"
           curl -N -s -X POST http://localhost:11434/api/generate \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt}}\",\"stream\":true}"
+            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt }}\",\"stream\":true}"
+          echo ""
+          echo "----- End Streaming Output -----"
+
+      - name: Run prompt in non-streaming mode (for metrics)
+        run: |
+          JSON_RESP=$(curl -s -X POST http://localhost:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"llama3:8b\",\"prompt\":\"${{ github.event.inputs.prompt }}\",\"stream\":false}\")
+
+          echo "Raw JSON (first 500 chars):"
+          echo "$JSON_RESP" | head -c 500
+          echo ""
+
+          EVAL_COUNT=$(echo "$JSON_RESP" | jq -r '.eval_count // .generations[0].eval_count // empty')
+          EVAL_DURATION=$(echo "$JSON_RESP" | jq -r '.eval_duration // .generations[0].eval_duration // empty')
+
+          if [ -n "$EVAL_COUNT" ] && [ -n "$EVAL_DURATION" ]; then
+            DURATION_SEC=$(echo "scale=6; $EVAL_DURATION/1000000000" | bc -l)
+            TOKENS_PER_SEC=$(echo "scale=2; $EVAL_COUNT/$DURATION_SEC" | bc -l)
+            echo "----- Metrics -----"
+            echo "eval_count (tokens): $EVAL_COUNT"
+            echo "eval_duration (ns): $EVAL_DURATION"
+            echo "eval_duration (s): $DURATION_SEC"
+            echo "tokens/sec ≈ $TOKENS_PER_SEC"
+            echo "------------------"
+          else
+            echo "No metrics found in response."
+          fi
