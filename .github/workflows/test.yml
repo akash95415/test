@@ -1,70 +1,89 @@
-name: Ollama Benchmark
+name: Ollama Llama3 8B Eval (macOS 13)
 
 on:
   workflow_dispatch:
     inputs:
       prompt:
-        description: 'Prompt to send to the model'
+        description: "Prompt to send to Ollama"
         required: true
-        default: 'Benchmark: generate 128 tokens to measure speed'
-      macos_runner:
-        description: 'Choose macOS runner version'
-        required: true
-        default: 'macos-latest'
-        type: choice
-        options:
-          - macos-latest
-          - macos-14
-          - macos-15
-          - macos-13
+        default: "Benchmark: generate 128 tokens of simple text to measure speed."
 
 jobs:
-  benchmark:
-    runs-on: ${{ github.event.inputs.macos_runner }}
-
+  ollama-eval:
+    runs-on: macos-13
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run Ollama benchmark
-        shell: bash
+      - name: Install deps & Ollama (macOS 13)
         run: |
-          set -euo pipefail
+          brew update || true
+          brew install jq || true
+          brew install ollama || true
+          if ! command -v ollama >/dev/null 2>&1; then
+            echo "Fallback to official installer..."
+            curl -fsSL https://ollama.com/install.sh | sh
+          fi
+          ollama --version
 
+      - name: Start Ollama server and wait
+        run: |
+          export OLLAMA_PORT=11434
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          for i in {1..30}; do
+            if curl -s "http://localhost:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+              echo "Ollama up"
+              break
+            fi
+            echo "waiting for ollama... ($i)"
+            sleep 2
+          done
+          curl -s "http://localhost:${OLLAMA_PORT}/" || (echo "Ollama didn't start" && tail -n +1 /tmp/ollama.log && exit 1)
+
+      - name: Pull model (llama3:8b)
+        run: |
           MODEL="llama3:8b"
-          PROMPT="${{ github.event.inputs.prompt }}"
-          OLLAMA_PORT=11434
+          ollama pull "$MODEL" || (echo "warning: pull failed or model unavailable; continuing" && true)
 
-          echo "Installing dependencies..."
-          brew install jq ollama
+      - name: Streaming generation (macOS 13)
+        env:
+          PROMPT: ${{ github.event.inputs.prompt }}
+        run: |
+          MODEL="llama3:8b"
+          echo "=== STREAM START ==="
+          jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:true}' \
+            | curl -s -N -X POST "http://localhost:11434/api/generate" \
+                -H "Content-Type: application/json" -d @- \
+            | tee /tmp/ollama_stream.ndjson
+          echo "=== STREAM END ==="
+          tail -c 1024 /tmp/ollama_stream.ndjson || true
 
-          echo "Starting Ollama server..."
-          nohup ollama serve >/tmp/ollama.log 2>&1 &
-          sleep 5
+      - name: Non-streaming generation (metrics) (macOS 13)
+        env:
+          PROMPT: ${{ github.event.inputs.prompt }}
+        run: |
+          MODEL="llama3:8b"
+          jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}' \
+            | curl -s -X POST "http://localhost:11434/api/generate" \
+                -H "Content-Type: application/json" -d @- \
+            > /tmp/ollama_resp.json
 
-          echo "Pulling model…"
-          ollama pull "$MODEL"
-
-          echo "Running benchmark with prompt: $PROMPT"
-          JSON=$(curl -s -X POST "http://localhost:${OLLAMA_PORT}/api/generate" \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPT}\",\"stream\":false}")
-
-          echo "Response preview:"
-          echo "$JSON" | head -c 800
+          head -c 800 /tmp/ollama_resp.json || true
           echo
 
-          EVAL_COUNT=$(echo "$JSON" | jq -r '.eval_count // .generations[0].eval_count // empty')
-          EVAL_DURATION_NS=$(echo "$JSON" | jq -r '.eval_duration // .generations[0].eval_duration // empty')
+          EVAL_COUNT=$(jq -r '.eval_count // .generations[0].eval_count // ""' /tmp/ollama_resp.json)
+          EVAL_DURATION_NS=$(jq -r '.eval_duration // .generations[0].eval_duration // ""' /tmp/ollama_resp.json)
 
           if [[ -n "$EVAL_COUNT" && -n "$EVAL_DURATION_NS" ]]; then
-            DURATION_S=$(awk -v ns="$EVAL_DURATION_NS" 'BEGIN { printf "%.6f", ns/1e9 }')
-            TPS=$(awk -v t="$EVAL_COUNT" -v s="$DURATION_S" 'BEGIN { if (s>0) printf "%.2f", t/s; else print "inf" }')
-            echo "=== Metrics ==="
-            echo "Tokens generated: $EVAL_COUNT"
-            echo "Time (s): $DURATION_S"
-            echo "Tokens/sec: $TPS"
+            DURATION_S=$(awk -v ns="$EVAL_DURATION_NS" 'BEGIN{printf "%.6f", ns/1e9}')
+            TPS=$(awk -v t="$EVAL_COUNT" -v s="$DURATION_S" 'BEGIN{ if (s>0) printf "%.2f", t/s; else print "NaN"}')
+            echo "===== METRICS ====="
+            echo "eval_count (tokens): $EVAL_COUNT"
+            echo "eval_duration (ns): $EVAL_DURATION_NS"
+            echo "eval_duration (s): $DURATION_S"
+            echo "tokens/sec: $TPS"
+            echo "==================="
           else
-            echo "Metrics not found—saving full JSON to /tmp/ollama_resp.json"
-            echo "$JSON" > /tmp/ollama_resp.json
+            echo "No metrics found — inspect /tmp/ollama_resp.json"
+            jq '.' /tmp/ollama_resp.json || true
           fi
