@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- CONFIG ---
+MODEL="llama3:8b"
+PROMPT="Benchmark: generate 128 tokens of simple text to measure speed."
+TEST_TOKEN_GOAL=128             # expected token generation in the response (approx)
+OLLAMA_PORT=11434
+# ----------------
+
+# helper
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+echo "1) Check/install Homebrew (if needed) and jq..."
+if ! command_exists brew; then
+  echo "Homebrew not found. Installing Homebrew..."
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+fi
+if ! command_exists jq; then
+  echo "Installing jq..."
+  brew install jq
+fi
+
+echo "2) Install Ollama (if missing)..."
+if ! command_exists ollama; then
+  echo "Installing ollama via Homebrew..."
+  brew install ollama
+fi
+
+echo "3) Ensure Ollama server is running..."
+# Start Ollama as a background service if not running
+if ! curl -s "http://localhost:${OLLAMA_PORT}/" >/dev/null 2>&1 ; then
+  echo "Starting ollama server in background..."
+  # Start as a background service (Homebrew service) or run serve in background depending on user preference
+  if command_exists brew && brew services list | grep -q "ollama"; then
+    brew services start ollama || true
+  else
+    # start manually in background (this will not persist across reboots)
+    nohup ollama serve >/tmp/ollama.log 2>&1 &
+    sleep 2
+  fi
+  # wait for server
+  for i in {1..15}; do
+    if curl -s "http://localhost:${OLLAMA_PORT}/" | grep -q "Ollama"; then
+      echo "Ollama server running."
+      break
+    fi
+    echo "Waiting for Ollama server..."
+    sleep 1
+  done
+fi
+
+echo "4) Pull model: ${MODEL} (will skip if already downloaded)..."
+ollama pull "${MODEL}"
+
+echo "5) Run a single generation via the Ollama HTTP API and capture metrics..."
+# We instruct streaming false to get final metadata fields (eval_count, eval_duration)
+read -r JSON_RESP <<EOF
+$(curl -s -X POST "http://localhost:${OLLAMA_PORT}/api/generate" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPT}\",\"stream\":false}")
+EOF
+
+if [ -z "$JSON_RESP" ]; then
+  echo "No response from Ollama API. Check the server at http://localhost:${OLLAMA_PORT}/"
+  exit 1
+fi
+
+echo "Raw JSON response (first 800 chars):"
+echo "${JSON_RESP}" | head -c 800
+echo -e "\n"
+
+# Try to extract eval_count and eval_duration (Ollama returns these in many models)
+EVAL_COUNT=$(echo "${JSON_RESP}" | jq -r '.eval_count // .generations[0].eval_count // empty')
+EVAL_DURATION_NS=$(echo "${JSON_RESP}" | jq -r '.eval_duration // .generations[0].eval_duration // empty')
+
+# Fallback: some model outputs nested under 'generations' or 'response'
+if [ -z "${EVAL_COUNT}" ] || [ "${EVAL_COUNT}" = "null" ]; then
+  EVAL_COUNT=""
+fi
+if [ -z "${EVAL_DURATION_NS}" ] || [ "${EVAL_DURATION_NS}" = "null" ]; then
+  EVAL_DURATION_NS=""
+fi
+
+if [ -n "${EVAL_COUNT}" ] && [ -n "${EVAL_DURATION_NS}" ]; then
+  # eval_duration is often in nanoseconds (per Ollama docs / examples)
+  # convert ns -> seconds
+  DURATION_S=$(awk -v ns="${EVAL_DURATION_NS}" 'BEGIN{printf "%.6f", ns/1e9}')
+  TOKENS_PER_SEC=$(awk -v t="${EVAL_COUNT}" -v s="${DURATION_S}" 'BEGIN{ if (s>0) printf "%.2f", t/s; else print "inf"}')
+  echo "Metrics found from model response:"
+  echo "  eval_count (tokens generated): ${EVAL_COUNT}"
+  echo "  eval_duration (ns): ${EVAL_DURATION_NS}"
+  echo "  eval_duration (s): ${DURATION_S}"
+  echo "  TOKENS/sec ≈ ${TOKENS_PER_SEC}"
+else
+  echo "Could not find eval_count / eval_duration fields in the response JSON."
+  echo "Full JSON (saved to /tmp/ollama_resp.json)"
+  echo "${JSON_RESP}" > /tmp/ollama_resp.json
+  echo "You can inspect /tmp/ollama_resp.json to find timing fields—some models return metrics nested inside other keys."
+fi
+
+echo -e "\n(If you want repeated benchmarking, wrap the curl call in a loop and average tokens/sec.)"
