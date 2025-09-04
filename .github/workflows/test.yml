@@ -1,0 +1,70 @@
+name: Ollama Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt to send to the model'
+        required: true
+        default: 'Benchmark: generate 128 tokens to measure speed'
+      macos_runner:
+        description: 'Choose macOS runner version'
+        required: true
+        default: 'macos-latest'
+        type: choice
+        options:
+          - macos-latest
+          - macos-14
+          - macos-15
+          - macos-13
+
+jobs:
+  benchmark:
+    runs-on: ${{ github.event.inputs.macos_runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Ollama benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODEL="llama3:8b"
+          PROMPT="${{ github.event.inputs.prompt }}"
+          OLLAMA_PORT=11434
+
+          echo "Installing dependencies..."
+          brew install jq ollama
+
+          echo "Starting Ollama server..."
+          nohup ollama serve >/tmp/ollama.log 2>&1 &
+          sleep 5
+
+          echo "Pulling model…"
+          ollama pull "$MODEL"
+
+          echo "Running benchmark with prompt: $PROMPT"
+          JSON=$(curl -s -X POST "http://localhost:${OLLAMA_PORT}/api/generate" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPT}\",\"stream\":false}")
+
+          echo "Response preview:"
+          echo "$JSON" | head -c 800
+          echo
+
+          EVAL_COUNT=$(echo "$JSON" | jq -r '.eval_count // .generations[0].eval_count // empty')
+          EVAL_DURATION_NS=$(echo "$JSON" | jq -r '.eval_duration // .generations[0].eval_duration // empty')
+
+          if [[ -n "$EVAL_COUNT" && -n "$EVAL_DURATION_NS" ]]; then
+            DURATION_S=$(awk -v ns="$EVAL_DURATION_NS" 'BEGIN { printf "%.6f", ns/1e9 }')
+            TPS=$(awk -v t="$EVAL_COUNT" -v s="$DURATION_S" 'BEGIN { if (s>0) printf "%.2f", t/s; else print "inf" }')
+            echo "=== Metrics ==="
+            echo "Tokens generated: $EVAL_COUNT"
+            echo "Time (s): $DURATION_S"
+            echo "Tokens/sec: $TPS"
+          else
+            echo "Metrics not found—saving full JSON to /tmp/ollama_resp.json"
+            echo "$JSON" > /tmp/ollama_resp.json
+          fi
